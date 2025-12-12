@@ -28,7 +28,7 @@ SECRET_KEY = config('SECRET_KEY', default='django-insecure-your-secret-key-here'
 DEBUG = config('DEBUG', default=True, cast=bool)  # Changed to True for development
 
 # Docker-compatible ALLOWED_HOSTS
-ALLOWED_HOSTS = ['34.224.216.146', '127.0.0.1', '0.0.0.0', 'backend', '20.243.177.192', 'frontend']
+ALLOWED_HOSTS = ['98.82.187.247', '127.0.0.1', '0.0.0.0', 'backend', '20.243.177.192', 'frontend']
 
 
 # Application definition
@@ -214,23 +214,23 @@ CORS_ALLOW_CREDENTIALS = True
 
 # Specific allowed origins (backup)
 CORS_ALLOWED_ORIGINS = [
-    "http://20.243.177.192:3000",
+    "http://98.82.187.247:3000",
     "http://localhost:3000", 
     "http://127.0.0.1:3000",
     "http://localhost:3001",
     "http://127.0.0.1:3001",
     "http://frontend:80",
     "http://localhost:80",
-    "http://20.243.177.192:80",
+    "http://98.82.187.247:80",
 ]
 
 # CSRF trusted origins
 CSRF_TRUSTED_ORIGINS = [
-    "http://20.243.177.192:3000",
+    "http://98.82.187.247:3000",
     "http://localhost:3000",
     "http://127.0.0.1:3000", 
     "http://frontend:80",
-    "http://20.243.177.192:80",
+    "http://98.82.187.247:80",
 ]
 
 # CORS headers settings
