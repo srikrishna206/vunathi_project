@@ -52,14 +52,14 @@ services:
     restart: unless-stopped
     networks:
       - novya_net
+    volumes:
+      - static_media:/app/static_media
+      - backend_logs:/app/logs
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-    volumes:
-      - static_media:/app/static_media
-      - backend_logs:/app/logs   # <<< FIX ADDED
 
   novya-ai-backend:
     image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-ai-backend:${IMAGE_TAG:-latest}"
@@ -93,7 +93,7 @@ services:
 volumes:
   pgdata:
   static_media:
-  backend_logs:   # <<< ADDED
+  backend_logs:
 
 networks:
   novya_net:
