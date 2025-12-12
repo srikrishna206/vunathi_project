@@ -7,22 +7,20 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# --- FIX: Create /app/logs and make it writable ---
-# This prevents Django from failing with PermissionError
+# Create logs directory (Django expects this)
 RUN mkdir -p /app/logs && chmod -R 777 /app/logs
-# ----------------------------------------------------
 
-# system deps for psycopg2 and other compiled libs
+# Install system deps for PostgreSQL, psycopg2, etc.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev gcc && rm -rf /var/lib/apt/lists/*
+    build-essential libpq-dev gcc curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# NOTE: since build context is ./backend, requirements.txt is at the root of the context
-COPY requirements.txt ./requirements.txt
-RUN pip install --upgrade pip
-RUN pip install -r ./requirements.txt
+# Copy requirements and install
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# copy entire backend code into container
-COPY . ./
+# Copy project
+COPY . .
 
 EXPOSE 8000
 
