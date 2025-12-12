@@ -32,7 +32,7 @@ services:
 
   novya-backend:
     # use either image (from Docker Hub) or build() - choose one
-    image: "${DOCKERHUB_OWNER:-jeevankumar01}/novya-backend:${IMAGE_TAG:-latest}"
+    image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-backend:${IMAGE_TAG:-latest}"
     # build:
     #   context: ./backend
     #   dockerfile: Dockerfile
@@ -65,7 +65,7 @@ services:
       - static_media:/app/static_media
 
   novya-ai-backend:
-    image: "${DOCKERHUB_OWNER:-jeevankumar01}/novya-ai-backend:${IMAGE_TAG:-latest}"
+    image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-ai-backend:${IMAGE_TAG:-latest}"
     # build:
     #   context: ./backend/ai_backend
     env_file:
@@ -84,7 +84,7 @@ services:
       retries: 3
 
   novya-frontend:
-    image: "${DOCKERHUB_OWNER:-jeevankumar01}/novya-frontend:${IMAGE_TAG:-latest}"
+    image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-frontend:${IMAGE_TAG:-latest}"
     # build:
     #   context: ./novya-frontend-main
     env_file:
