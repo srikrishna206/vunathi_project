@@ -1,15 +1,18 @@
-# backend/ai_backend/Dockerfile
-FROM python:3.10-slim
+# ai_backend/Dockerfile
+FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r /app/requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential && rm -rf /var/lib/apt/lists/*
 
-COPY . /app
+# since build context is ./backend/ai_backend, requirements.txt is at the root of that context
+COPY requirements.txt ./requirements.txt
+RUN pip install --upgrade pip
+RUN pip install -r ./requirements.txt
 
-EXPOSE 8001
+COPY . ./
 
-# If app.py defines "app" (Flask)
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]
+EXPOSE 5000
+# adjust command to how your app exposes WSGI/ASGI app; if Flask app variable is 'app' in app.py:
+CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "2"]
