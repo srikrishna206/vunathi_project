@@ -109,18 +109,39 @@ jobs:
 
       - name: Install backend test dependencies
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install -r backend/requirements.txt
 
-      # ⭐ FINAL FIX: force Django to accept localhost:8001
+      # ⭐ FIX 1 — Allow localhost:8001 without touching Django code
+      - name: Export ALLOWED_HOSTS
+        run: echo "ALLOWED_HOSTS=localhost,127.0.0.1,localhost:8001,*" >> $GITHUB_ENV
+
+      # ⭐ FIX 2 — Start Django server manually on port 8001
+      - name: Start Django server
+        run: |
+          cd backend
+          nohup python manage.py runserver 0.0.0.0:8001 &>/tmp/django.log &
+        shell: bash
+
+      # Wait for Django server to be ready
+      - name: Wait for Django
+        run: |
+          for i in {1..20}; do
+            curl -s http://127.0.0.1:8001/ && break
+            sleep 1
+          done
+          echo "--- Django log ---"
+          tail -n 50 /tmp/django.log || true
+
+      # ⭐ FIX 3 — Now tests pass because server is running and HOST is allowed
       - name: Run Django tests
         env:
           DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
-          ALLOWED_HOSTS: "*"
+          ALLOWED_HOSTS: "localhost,127.0.0.1,localhost:8001,*"
           DEBUG: "True"
         run: |
           cd backend
-          DJANGO_ALLOW_ASYNC_UNSAFE=true ALLOWED_HOSTS="*" python manage.py test --verbosity=2 --noinput
+          python manage.py test --verbosity=2 --noinput
 
   deploy:
     name: Deploy to EC2
