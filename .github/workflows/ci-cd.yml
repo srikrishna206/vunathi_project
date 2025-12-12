@@ -76,6 +76,7 @@ jobs:
     name: Test (backend)
     runs-on: ubuntu-latest
     needs: build-and-push
+
     services:
       postgres:
         image: postgres:15
@@ -95,6 +96,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Ensure /app exists and is writable on the runner (fixes PermissionError)
+      - name: Ensure /app/logs exists on runner
+        run: |
+          sudo mkdir -p /app/logs
+          sudo chmod -R 777 /app/logs
+          ls -ld /app /app/logs || true
+
       - name: Wait for Postgres to be ready
         run: |
           for i in {1..30}; do
@@ -111,9 +119,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
 
+      # Provide ALLOWED_HOSTS/DEBUG as environment variables so Django accepts requests
+      - name: Export ALLOWED_HOSTS & DEBUG for this job
+        run: |
+          echo "ALLOWED_HOSTS=localhost,127.0.0.1,localhost:8001" >> $GITHUB_ENV
+          echo "DEBUG=True" >> $GITHUB_ENV
+
+      # Start Django server in background on port 8001 (your tests hit this port)
+      - name: Start Django dev server (background)
+        run: |
+          cd backend
+          nohup python manage.py runserver 0.0.0.0:8001 &>/tmp/django-server.log &
+        shell: bash
+
+      - name: Wait for Django server to start
+        run: |
+          # Wait until server responds or timeout
+          for i in {1..15}; do
+            if curl -sS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
+              echo "Django server is responding"; break
+            fi
+            sleep 1
+          done
+          echo "=== tail of server log ==="
+          tail -n +1 /tmp/django-server.log || true
+
       - name: Run Django tests
         env:
           DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
+          # Ensure these env vars are available to manage.py during test run
+          ALLOWED_HOSTS: "localhost,127.0.0.1,localhost:8001"
+          DEBUG: "True"
         run: |
           cd backend
           python manage.py test --verbosity=2 --noinput
@@ -123,9 +159,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-    # expose the image tag produced in build-and-push to the deploy step
     env:
       IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -135,7 +171,6 @@ jobs:
 
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v0.1.8
-        # make IMAGE_TAG available to the remote script (expanded client-side)
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
         with:
@@ -146,7 +181,6 @@ jobs:
           script: |
             set -euo pipefail
 
-            # injected secrets (shell-side variables)
             DEPLOY_DIR="${{ secrets.EC2_DEPLOY_DIR }}"
             DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
             DOCKERHUB_TOKEN="${{ secrets.DOCKERHUB_TOKEN }}"
@@ -154,100 +188,26 @@ jobs:
             BRANCH="${{ secrets.BRANCH || env.DEPLOY_BRANCH }}"
             IMAGE_TAG="${IMAGE_TAG:-latest}"
 
-            if [ -z "$DEPLOY_DIR" ]; then
-              echo "EC2_DEPLOY_DIR secret is empty — aborting."
-              exit 1
-            fi
-
-            # create directory and ensure ownership so git doesn't complain
             sudo mkdir -p "$DEPLOY_DIR"
-            CURUSER="$(id -un)"
-            CURUID="$(id -u)"
-            CURGID="$(id -g)"
-            sudo chown -R "${CURUID}:${CURGID}" "$DEPLOY_DIR" || true
+            sudo chown -R $(id -u):$(id -g) "$DEPLOY_DIR"
 
-            # clone if not present
             if [ ! -d "$DEPLOY_DIR/.git" ]; then
-              if [ -n "$EC2_REPO_URL" ]; then
-                rm -rf "${DEPLOY_DIR:?}"/*
-                git clone "$EC2_REPO_URL" "$DEPLOY_DIR"
-              else
-                echo "No repo at $DEPLOY_DIR and EC2_REPO_URL not provided. Aborting."
-                exit 1
-              fi
+              git clone "$EC2_REPO_URL" "$DEPLOY_DIR"
             fi
 
             cd "$DEPLOY_DIR"
+            git fetch --all --prune
+            git checkout "$BRANCH"
+            git reset --hard origin/"$BRANCH"
 
-            # avoid 'dubious ownership' git error
-            git config --global --add safe.directory "$DEPLOY_DIR" || true
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-            # update branch
-            git fetch --all --prune || true
-            git checkout "$BRANCH" || true
-            # if there are local edits to docker-compose.yml we don't want to fail.
-            git reset --hard origin/"$BRANCH" || true
-            git pull origin "$BRANCH" || true
+            docker compose pull
+            docker compose up -d --remove-orphans
 
-            # ensure docker & compose
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo apt-get install -y docker.io
-              sudo usermod -aG docker "$CURUSER" || true
-            fi
-            if ! docker compose version >/dev/null 2>&1; then
-              sudo apt-get update
-              sudo apt-get install -y docker-compose-plugin
-            fi
+            docker compose run --rm novya-backend python manage.py migrate --noinput
+            docker compose run --rm novya-backend python manage.py collectstatic --noinput
 
-            # login to Docker Hub if credentials provided
-            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-              echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-            else
-              echo "No Docker Hub credentials provided; will attempt to pull public images only."
-            fi
-
-            # Use your Docker Hub namespace shown in your screenshot
-            DOCKERHUB_OWNER="jeevankumar01"
-
-            # Replace placeholder owner in compose with actual Docker Hub username (safe)
-            sed -i "s|\${DOCKERHUB_OWNER:-your-dockerhub-username}|${DOCKERHUB_OWNER}|g" docker-compose.yml || true
-
-            # Pull both the IMAGE_TAG (short SHA) and latest for each image (best-effort)
-            IMAGES=(
-              "${DOCKERHUB_OWNER}/novya-backend:${IMAGE_TAG}"
-              "${DOCKERHUB_OWNER}/novya-backend:latest"
-              "${DOCKERHUB_OWNER}/novya-ai-backend:${IMAGE_TAG}"
-              "${DOCKERHUB_OWNER}/novya-ai-backend:latest"
-              "${DOCKERHUB_OWNER}/novya-frontend:${IMAGE_TAG}"
-              "${DOCKERHUB_OWNER}/novya-frontend:latest"
-            )
-
-            for img in "${IMAGES[@]}"; do
-              echo "Pulling image: $img"
-              docker pull "$img" || echo "Warning: failed to pull $img (may be private or not exist)"
-            done
-
-            # To make docker-compose use the tagged images we just pulled (instead of :latest),
-            # replace occurrences of ":latest" in known image references with ":${IMAGE_TAG}".
-            sed -i "s|${DOCKERHUB_OWNER}/novya-backend:latest|${DOCKERHUB_OWNER}/novya-backend:${IMAGE_TAG}|g" docker-compose.yml || true
-            sed -i "s|${DOCKERHUB_OWNER}/novya-ai-backend:latest|${DOCKERHUB_OWNER}/novya-ai-backend:${IMAGE_TAG}|g" docker-compose.yml || true
-            sed -i "s|${DOCKERHUB_OWNER}/novya-frontend:latest|${DOCKERHUB_OWNER}/novya-frontend:${IMAGE_TAG}|g" docker-compose.yml || true
-
-            # Bring up the stack (will use images available locally if present)
-            docker compose pull || true
-            docker compose up --remove-orphans -d
-
-            # Run migrations and collectstatic
-            docker compose run --rm backend python manage.py migrate --noinput || true
-            docker compose run --rm backend python manage.py collectstatic --noinput || true
-
-            # Show status and the images (visible in Actions logs)
-            echo "=== docker compose ps ==="
-            docker compose ps || true
-            echo "=== docker ps (running containers) ==="
-            docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}" || true
-            echo "=== docker images (local images) ==="
-            docker images | sed -n '1,200p' || true
-
-            echo "Deployed images from Docker Hub owner: ${DOCKERHUB_OWNER} with tag: ${IMAGE_TAG}"
+            docker compose ps
+            docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}"
+            docker images | head
