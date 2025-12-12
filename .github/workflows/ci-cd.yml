@@ -1,0 +1,253 @@
+name: CI / Build / Test / Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  DEPLOY_BRANCH: main
+
+jobs:
+  build-and-push:
+    name: Build & Push images
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set IMAGE_TAG (short SHA)
+        id: set-tag
+        run: |
+          TAG=$(echo "${GITHUB_SHA}" | cut -c1-8)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./novya-frontend-main
+          file: ./novya-frontend-main/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-frontend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-frontend:${{ steps.set-tag.outputs.tag }}
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-backend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-backend:${{ steps.set-tag.outputs.tag }}
+
+      - name: Build & push ai_backend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend/ai_backend
+          file: ./backend/ai_backend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-ai-backend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-ai-backend:${{ steps.set-tag.outputs.tag }}
+
+  test:
+    name: Test (backend)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: novya
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: 12345
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Wait for Postgres to be ready
+        run: |
+          for i in {1..30}; do
+            pg_isready -h 127.0.0.1 -p 5433 -U postgres && break || sleep 2
+          done
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run Django tests
+        env:
+          DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
+        run: |
+          cd backend
+          python manage.py test --verbosity=2 --noinput
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # expose the image tag produced in build-and-push to the deploy step
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure ssh client is available
+        run: sudo apt-get update && sudo apt-get install -y openssh-client git
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v0.1.8
+        # make IMAGE_TAG available to the remote script (expanded client-side)
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+
+            # injected secrets (shell-side variables)
+            DEPLOY_DIR="${{ secrets.EC2_DEPLOY_DIR }}"
+            DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+            DOCKERHUB_TOKEN="${{ secrets.DOCKERHUB_TOKEN }}"
+            EC2_REPO_URL="${{ secrets.EC2_REPO_URL }}"
+            BRANCH="${{ secrets.BRANCH || env.DEPLOY_BRANCH }}"
+            IMAGE_TAG="${IMAGE_TAG:-latest}"
+
+            if [ -z "$DEPLOY_DIR" ]; then
+              echo "EC2_DEPLOY_DIR secret is empty — aborting."
+              exit 1
+            fi
+
+            # create directory and ensure ownership so git doesn't complain
+            sudo mkdir -p "$DEPLOY_DIR"
+            CURUSER="$(id -un)"
+            CURUID="$(id -u)"
+            CURGID="$(id -g)"
+            sudo chown -R "${CURUID}:${CURGID}" "$DEPLOY_DIR" || true
+
+            # clone if not present
+            if [ ! -d "$DEPLOY_DIR/.git" ]; then
+              if [ -n "$EC2_REPO_URL" ]; then
+                rm -rf "${DEPLOY_DIR:?}"/*
+                git clone "$EC2_REPO_URL" "$DEPLOY_DIR"
+              else
+                echo "No repo at $DEPLOY_DIR and EC2_REPO_URL not provided. Aborting."
+                exit 1
+              fi
+            fi
+
+            cd "$DEPLOY_DIR"
+
+            # avoid 'dubious ownership' git error
+            git config --global --add safe.directory "$DEPLOY_DIR" || true
+
+            # update branch
+            git fetch --all --prune || true
+            git checkout "$BRANCH" || true
+            # if there are local edits to docker-compose.yml we don't want to fail.
+            git reset --hard origin/"$BRANCH" || true
+            git pull origin "$BRANCH" || true
+
+            # ensure docker & compose
+            if ! command -v docker >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y docker.io
+              sudo usermod -aG docker "$CURUSER" || true
+            fi
+            if ! docker compose version >/dev/null 2>&1; then
+              sudo apt-get update
+              sudo apt-get install -y docker-compose-plugin
+            fi
+
+            # login to Docker Hub if credentials provided
+            if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+              echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            else
+              echo "No Docker Hub credentials provided; will attempt to pull public images only."
+            fi
+
+            # Use your Docker Hub namespace shown in your screenshot
+            DOCKERHUB_OWNER="jeevankumar01"
+
+            # Replace placeholder owner in compose with actual Docker Hub username (safe)
+            sed -i "s|\${DOCKERHUB_OWNER:-your-dockerhub-username}|${DOCKERHUB_OWNER}|g" docker-compose.yml || true
+
+            # Pull both the IMAGE_TAG (short SHA) and latest for each image (best-effort)
+            IMAGES=(
+              "${DOCKERHUB_OWNER}/novya-backend:${IMAGE_TAG}"
+              "${DOCKERHUB_OWNER}/novya-backend:latest"
+              "${DOCKERHUB_OWNER}/novya-ai-backend:${IMAGE_TAG}"
+              "${DOCKERHUB_OWNER}/novya-ai-backend:latest"
+              "${DOCKERHUB_OWNER}/novya-frontend:${IMAGE_TAG}"
+              "${DOCKERHUB_OWNER}/novya-frontend:latest"
+            )
+
+            for img in "${IMAGES[@]}"; do
+              echo "Pulling image: $img"
+              docker pull "$img" || echo "Warning: failed to pull $img (may be private or not exist)"
+            done
+
+            # To make docker-compose use the tagged images we just pulled (instead of :latest),
+            # replace occurrences of ":latest" in known image references with ":${IMAGE_TAG}".
+            sed -i "s|${DOCKERHUB_OWNER}/novya-backend:latest|${DOCKERHUB_OWNER}/novya-backend:${IMAGE_TAG}|g" docker-compose.yml || true
+            sed -i "s|${DOCKERHUB_OWNER}/novya-ai-backend:latest|${DOCKERHUB_OWNER}/novya-ai-backend:${IMAGE_TAG}|g" docker-compose.yml || true
+            sed -i "s|${DOCKERHUB_OWNER}/novya-frontend:latest|${DOCKERHUB_OWNER}/novya-frontend:${IMAGE_TAG}|g" docker-compose.yml || true
+
+            # Bring up the stack (will use images available locally if present)
+            docker compose pull || true
+            docker compose up --remove-orphans -d
+
+            # Run migrations and collectstatic
+            docker compose run --rm backend python manage.py migrate --noinput || true
+            docker compose run --rm backend python manage.py collectstatic --noinput || true
+
+            # Show status and the images (visible in Actions logs)
+            echo "=== docker compose ps ==="
+            docker compose ps || true
+            echo "=== docker ps (running containers) ==="
+            docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}" || true
+            echo "=== docker images (local images) ==="
+            docker images | sed -n '1,200p' || true
+
+            echo "Deployed images from Docker Hub owner: ${DOCKERHUB_OWNER} with tag: ${IMAGE_TAG}"
