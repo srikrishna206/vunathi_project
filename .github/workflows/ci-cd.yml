@@ -96,12 +96,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Ensure /app exists and is writable on the runner (fixes PermissionError)
-      - name: Ensure /app/logs exists on runner
+      - name: Show initial /app status (diagnostic)
+        run: |
+          echo "=== initial /app status ==="
+          ls -ld /app || true
+          echo "whoami: $(whoami)"
+          echo "id: $(id)"
+          echo "=== mounts (top) ==="
+          mount | sed -n '1,120p' || true
+
+      - name: Create /app and /app/logs and set ownership (robust)
         run: |
           sudo mkdir -p /app/logs
-          sudo chmod -R 777 /app/logs
-          ls -ld /app /app/logs || true
+          sudo chown -R $(id -u):$(id -g) /app
+          echo "=== after create/chown ==="
+          ls -ld /app || true
+          ls -ld /app/logs || true
+          stat -c '%U %G %a %n' /app || true
+          stat -c '%U %G %a %n' /app/logs || true
 
       - name: Wait for Postgres to be ready
         run: |
@@ -119,13 +131,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
 
-      # Provide ALLOWED_HOSTS/DEBUG as environment variables so Django accepts requests
-      - name: Export ALLOWED_HOSTS & DEBUG for this job
+      - name: Export ALLOWED_HOSTS & DEBUG to env (CI)
         run: |
           echo "ALLOWED_HOSTS=localhost,127.0.0.1,localhost:8001" >> $GITHUB_ENV
           echo "DEBUG=True" >> $GITHUB_ENV
 
-      # Start Django server in background on port 8001 (your tests hit this port)
       - name: Start Django dev server (background)
         run: |
           cd backend
@@ -134,20 +144,18 @@ jobs:
 
       - name: Wait for Django server to start
         run: |
-          # Wait until server responds or timeout
-          for i in {1..15}; do
+          for i in {1..20}; do
             if curl -sS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
               echo "Django server is responding"; break
             fi
             sleep 1
           done
-          echo "=== tail of server log ==="
-          tail -n +1 /tmp/django-server.log || true
+          echo "=== tail of server log (last 200 lines) ==="
+          tail -n 200 /tmp/django-server.log || true
 
       - name: Run Django tests
         env:
           DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
-          # Ensure these env vars are available to manage.py during test run
           ALLOWED_HOSTS: "localhost,127.0.0.1,localhost:8001"
           DEBUG: "True"
         run: |
