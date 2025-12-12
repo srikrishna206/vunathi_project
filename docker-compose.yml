@@ -31,11 +31,7 @@ services:
       - novya_net
 
   novya-backend:
-    # use either image (from Docker Hub) or build() - choose one
     image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-backend:${IMAGE_TAG:-latest}"
-    # build:
-    #   context: ./backend
-    #   dockerfile: Dockerfile
     depends_on:
       - postgres
       - redis
@@ -63,11 +59,10 @@ services:
       retries: 3
     volumes:
       - static_media:/app/static_media
+      - backend_logs:/app/logs   # <<< FIX ADDED
 
   novya-ai-backend:
     image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-ai-backend:${IMAGE_TAG:-latest}"
-    # build:
-    #   context: ./backend/ai_backend
     env_file:
       - .env
     environment:
@@ -85,8 +80,6 @@ services:
 
   novya-frontend:
     image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-frontend:${IMAGE_TAG:-latest}"
-    # build:
-    #   context: ./novya-frontend-main
     env_file:
       - .env
     environment:
@@ -100,6 +93,7 @@ services:
 volumes:
   pgdata:
   static_media:
+  backend_logs:   # <<< ADDED
 
 networks:
   novya_net:
