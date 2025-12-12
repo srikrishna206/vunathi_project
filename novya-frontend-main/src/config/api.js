@@ -4,8 +4,8 @@
 
 // Backend URLs - Using service names for Docker, localhost for browser
 const isBrowser = typeof window !== 'undefined';
-const DJANGO_BASE_URL = process.env.REACT_APP_DJANGO_URL || (isBrowser ? 'http://34.224.216.146:8000/api' : 'http://backend:8000/api');
-const FASTAPI_BASE_URL = process.env.REACT_APP_FASTAPI_URL || (isBrowser ? 'http://34.224.216.146:8001' : 'http://ai-backend:8001');
+const DJANGO_BASE_URL = process.env.REACT_APP_DJANGO_URL || (isBrowser ? 'http://98.82.187.247:8000/api' : 'http://backend:8000/api');
+const FASTAPI_BASE_URL = process.env.REACT_APP_FASTAPI_URL || (isBrowser ? 'http://98.82.187.247:8001' : 'http://ai-backend:8001');
 
 /**
  * Return the child email stored during parent login (if applicable)
