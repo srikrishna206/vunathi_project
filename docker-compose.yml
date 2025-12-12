@@ -1,100 +1,197 @@
-version: "3.8"
+name: CI / Build / Test / Deploy
 
-services:
-  postgres:
-    image: postgres:15
-    restart: always
-    env_file:
-      - .env
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-novya}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-12345}
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    networks:
-      - novya_net
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
-      interval: 10s
-      timeout: 5s
-      retries: 8
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
-  redis:
-    image: redis:6
-    restart: always
-    env_file:
-      - .env
-    networks:
-      - novya_net
+permissions:
+  contents: read
+  packages: write
 
-  novya-backend:
-    image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-backend:${IMAGE_TAG:-latest}"
-    depends_on:
-      - postgres
-      - redis
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      SECRET_KEY: ${SECRET_KEY}
-      DEBUG: ${DEBUG}
-    command: >
-      sh -c "
-        python manage.py migrate --noinput &&
-        python manage.py collectstatic --noinput &&
-        gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 3
-      "
-    ports:
-      - "8000:8000"
-    restart: unless-stopped
-    networks:
-      - novya_net
-    volumes:
-      - static_media:/app/static_media
-      - backend_logs:/app/logs
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+env:
+  DEPLOY_BRANCH: main
 
-  novya-ai-backend:
-    image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-ai-backend:${IMAGE_TAG:-latest}"
-    env_file:
-      - .env
-    environment:
-      AI_API_KEY: ${AI_API_KEY}
-    ports:
-      - "5000:5000"
-    restart: unless-stopped
-    networks:
-      - novya_net
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5000/ || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+jobs:
+  build-and-push:
+    name: Build & Push images
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  novya-frontend:
-    image: "${DOCKERHUB_OWNER:-srikrishna206}/novya-frontend:${IMAGE_TAG:-latest}"
-    env_file:
-      - .env
-    environment:
-      REACT_APP_API_BASE: ${FRONTEND_API_BASE}
-    ports:
-      - "80:80"
-    restart: unless-stopped
-    networks:
-      - novya_net
+      - name: Set IMAGE_TAG (short SHA)
+        id: set-tag
+        run: |
+          TAG=$(echo "${GITHUB_SHA}" | cut -c1-8)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-volumes:
-  pgdata:
-  static_media:
-  backend_logs:
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v3
 
-networks:
-  novya_net:
-    driver: bridge
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./novya-frontend-main
+          file: ./novya-frontend-main/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-frontend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-frontend:${{ steps.set-tag.outputs.tag }}
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-backend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-backend:${{ steps.set-tag.outputs.tag }}
+
+      - name: Build & push ai_backend
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend/ai_backend
+          file: ./backend/ai_backend/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-ai-backend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/novya-ai-backend:${{ steps.set-tag.outputs.tag }}
+
+  test:
+    name: Test (backend)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: novya
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: 12345
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Wait for Postgres to be ready
+        run: |
+          for i in {1..30}; do
+            pg_isready -h 127.0.0.1 -p 5433 -U postgres && break || sleep 2
+          done
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      # --------------------------------------------------------
+      # FIX 1: Allow Django to accept localhost:8001 in GitHub Actions
+      # --------------------------------------------------------
+      - name: Configure Django env for CI tests
+        run: |
+          echo "ALLOWED_HOSTS=localhost,127.0.0.1,localhost:8001" >> backend/.env
+          echo "DEBUG=True" >> backend/.env
+
+      # --------------------------------------------------------
+      # FIX 2: Create /app/logs so Django settings won't fail
+      # --------------------------------------------------------
+      - name: Create /app/logs for Django
+        run: |
+          sudo mkdir -p /app/logs
+          sudo chmod -R 777 /app
+
+      # --------------------------------------------------------
+      # RUN TESTS
+      # --------------------------------------------------------
+      - name: Run Django tests
+        env:
+          DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
+        run: |
+          cd backend
+          python manage.py test --verbosity=2 --noinput
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure ssh client is available
+        run: sudo apt-get update && sudo apt-get install -y openssh-client git
+
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v0.1.8
+        env:
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+
+            DEPLOY_DIR="${{ secrets.EC2_DEPLOY_DIR }}"
+            DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
+            DOCKERHUB_TOKEN="${{ secrets.DOCKERHUB_TOKEN }}"
+            EC2_REPO_URL="${{ secrets.EC2_REPO_URL }}"
+            BRANCH="${{ secrets.BRANCH || env.DEPLOY_BRANCH }}"
+            IMAGE_TAG="${IMAGE_TAG:-latest}"
+
+            sudo mkdir -p "$DEPLOY_DIR"
+            sudo chown -R $(id -u):$(id -g) "$DEPLOY_DIR"
+
+            if [ ! -d "$DEPLOY_DIR/.git" ]; then
+              git clone "$EC2_REPO_URL" "$DEPLOY_DIR"
+            fi
+
+            cd "$DEPLOY_DIR"
+            git fetch --all --prune
+            git checkout "$BRANCH"
+            git reset --hard origin/"$BRANCH"
+
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            docker compose run --rm novya-backend python manage.py migrate --noinput
+            docker compose run --rm novya-backend python manage.py collectstatic --noinput
+
+            docker compose ps
+            docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}"
+            docker images | head
+
