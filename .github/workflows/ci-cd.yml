@@ -96,25 +96,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show initial /app status (diagnostic)
-        run: |
-          echo "=== initial /app status ==="
-          ls -ld /app || true
-          echo "whoami: $(whoami)"
-          echo "id: $(id)"
-          echo "=== mounts (top) ==="
-          mount | sed -n '1,120p' || true
-
-      - name: Create /app and /app/logs and set ownership (robust)
-        run: |
-          sudo mkdir -p /app/logs
-          sudo chown -R $(id -u):$(id -g) /app
-          echo "=== after create/chown ==="
-          ls -ld /app || true
-          ls -ld /app/logs || true
-          stat -c '%U %G %a %n' /app || true
-          stat -c '%U %G %a %n' /app/logs || true
-
       - name: Wait for Postgres to be ready
         run: |
           for i in {1..30}; do
@@ -131,36 +112,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
 
-      - name: Export ALLOWED_HOSTS & DEBUG to env (CI)
-        run: |
-          echo "ALLOWED_HOSTS=localhost,127.0.0.1,localhost:8001" >> $GITHUB_ENV
-          echo "DEBUG=True" >> $GITHUB_ENV
-
-      - name: Start Django dev server (background)
-        run: |
-          cd backend
-          nohup python manage.py runserver 0.0.0.0:8001 &>/tmp/django-server.log &
-        shell: bash
-
-      - name: Wait for Django server to start
-        run: |
-          for i in {1..20}; do
-            if curl -sS --max-time 2 http://127.0.0.1:8001/ >/dev/null 2>&1; then
-              echo "Django server is responding"; break
-            fi
-            sleep 1
-          done
-          echo "=== tail of server log (last 200 lines) ==="
-          tail -n 200 /tmp/django-server.log || true
-
+      # ⭐ FINAL FIX: force Django to accept localhost:8001
       - name: Run Django tests
         env:
           DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
-          ALLOWED_HOSTS: "localhost,127.0.0.1,localhost:8001"
+          ALLOWED_HOSTS: "*"
           DEBUG: "True"
         run: |
           cd backend
-          python manage.py test --verbosity=2 --noinput
+          DJANGO_ALLOW_ASYNC_UNSAFE=true ALLOWED_HOSTS="*" python manage.py test --verbosity=2 --noinput
 
   deploy:
     name: Deploy to EC2
@@ -213,8 +173,8 @@ jobs:
             docker compose pull
             docker compose up -d --remove-orphans
 
-            docker compose run --rm novya-backend python manage.py migrate --noinput
-            docker compose run --rm novya-backend python manage.py collectstatic --noinput
+            docker compose run --rm backend python manage.py migrate --noinput
+            docker compose run --rm backend python manage.py collectstatic --noinput
 
             docker compose ps
             docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}"
