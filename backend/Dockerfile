@@ -1,25 +1,22 @@
 # backend/Dockerfile
-FROM python:3.10-slim
+FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# system deps (adjust if needed)
-RUN apt-get update && apt-get install -y build-essential libpq-dev gcc --no-install-recommends && rm -rf /var/lib/apt/lists/*
+# system deps for psycopg2 and other compiled libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev gcc && rm -rf /var/lib/apt/lists/*
 
-# copy only requirements first for caching
-COPY requirements.txt /app/requirements.txt
+# NOTE: since build context is ./backend, requirements.txt is at the root of the context
+COPY requirements.txt ./requirements.txt
 RUN pip install --upgrade pip
-RUN pip install -r /app/requirements.txt
+RUN pip install -r ./requirements.txt
 
-# copy application code
-COPY . /app
-
-# collect static (optional - adjust STATIC settings in Django)
-# RUN python manage.py collectstatic --noinput
+# copy entire backend context into container
+COPY . ./
 
 EXPOSE 8000
-
-# Command: run with Gunicorn. Assumes Django wsgi: config.wsgi:application
 CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "120"]
