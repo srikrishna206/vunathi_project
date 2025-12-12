@@ -29,7 +29,7 @@ jobs:
           TAG=$(echo "${GITHUB_SHA}" | cut -c1-8)
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU (for multi-arch)
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
@@ -62,7 +62,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/novya-backend:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/novya-backend:${{ steps.set-tag.outputs.tag }}
 
-      - name: Build & push ai_backend
+      - name: Build & push ai backend
         uses: docker/build-push-action@v4
         with:
           context: ./backend/ai_backend
@@ -73,7 +73,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/novya-ai-backend:${{ steps.set-tag.outputs.tag }}
 
   test:
-    name: Test (backend)
+    name: Test Backend
     runs-on: ubuntu-latest
     needs: build-and-push
 
@@ -93,51 +93,55 @@ jobs:
           --health-retries 5
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Wait for Postgres to be ready
+      - name: Wait for PostgreSQL
         run: |
           for i in {1..30}; do
             pg_isready -h 127.0.0.1 -p 5433 -U postgres && break || sleep 2
           done
 
-      - name: Setup Python 3.11
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
 
-      - name: Install backend test dependencies
+      - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r backend/requirements.txt
 
-      # ⭐ FIX 1 — Allow localhost:8001 without touching Django code
-      - name: Export ALLOWED_HOSTS
-        run: echo "ALLOWED_HOSTS=localhost,127.0.0.1,localhost:8001,*" >> $GITHUB_ENV
+      # ⭐ ABSOLUTE FIX — override Django ALLOWED_HOSTS without editing code
+      - name: Force Django ALLOWED_HOSTS
+        run: |
+          echo "DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,localhost:8001,*" >> $GITHUB_ENV
 
-      # ⭐ FIX 2 — Start Django server manually on port 8001
-      - name: Start Django server
+      # ⭐ Start Django server for tests
+      - name: Start Django server on port 8001
+        env:
+          DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,localhost:8001,*"
         run: |
           cd backend
           nohup python manage.py runserver 0.0.0.0:8001 &>/tmp/django.log &
-        shell: bash
 
-      # Wait for Django server to be ready
-      - name: Wait for Django
+      - name: Wait for Django to start
         run: |
-          for i in {1..20}; do
+          for i in {1..30}; do
             curl -s http://127.0.0.1:8001/ && break
             sleep 1
           done
-          echo "--- Django log ---"
-          tail -n 50 /tmp/django.log || true
+          echo "--- Server Log ---"
+          tail -n 40 /tmp/django.log || true
 
-      # ⭐ FIX 3 — Now tests pass because server is running and HOST is allowed
-      - name: Run Django tests
+      # ⭐ Tests now pass because:
+      #   - server is running
+      #   - host is allowed
+      #   - JSON is returned
+      - name: Run Django Tests
         env:
           DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
-          ALLOWED_HOSTS: "localhost,127.0.0.1,localhost:8001,*"
+          DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,localhost:8001,*"
           DEBUG: "True"
         run: |
           cd backend
@@ -155,10 +159,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure ssh client is available
+      - name: Install SSH client
         run: sudo apt-get update && sudo apt-get install -y openssh-client git
 
-      - name: Deploy to EC2 via SSH
+      - name: Deploy to EC2
         uses: appleboy/ssh-action@v0.1.8
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
@@ -185,7 +189,7 @@ jobs:
             fi
 
             cd "$DEPLOY_DIR"
-            git fetch --all --prune
+            git fetch --all
             git checkout "$BRANCH"
             git reset --hard origin/"$BRANCH"
 
