@@ -1,0 +1,83 @@
+version: "3.8"
+
+# NOTE:
+# - Secrets (AI_API_KEY, SECRET_KEY) should be provided at runtime via an .env file
+#   (example: created temporarily by Jenkins in the workspace) or via environment.
+# - Example .env keys that your CI should provide:
+#     AI_API_KEY=sk-...
+#     SECRET_KEY=some_secret_for_django
+#
+# Jenkins pipeline example already writes a .env with AI_API_KEY and then uses:
+#   docker compose --env-file .env up -d
+#
+services:
+  db:
+    image: postgres:14
+    container_name: db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 12345
+      POSTGRES_DB: novya
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  redis:
+    image: redis:6
+    container_name: novya-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  novya-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: novya-backend
+    depends_on:
+      - db
+      - redis
+    environment:
+      POSTGRES_DB: novya
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 12345
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      SALT : 10
+      # SECRET_KEY is read from the environment (.env) at runtime if provided.
+      # If you don't provide SECRET_KEY in .env, set a default here (not recommended for prod).
+      SECRET_KEY: ${SECRET_KEY:-hardcoded_secret_key_change_me}
+    command: >
+      sh -c "
+        python manage.py migrate --noinput &&
+        python manage.py runserver 0.0.0.0:8000
+      "
+    ports:
+        - "8000:8000"
+    restart: unless-stopped
+
+  novya-ai-backend:
+    build:
+      context: ./backend/ai_backend
+      dockerfile: Dockerfile
+    container_name: novya-ai-backend
+    ports:
+      - "8001:8001"
+    environment:
+      # AI_API_KEY must be provided at runtime via .env or environment
+      AI_API_KEY: ${AI_API_KEY}
+    restart: unless-stopped
+
+  novya-frontend:
+    build:
+      context: ./novya-frontend-main
+      dockerfile: Dockerfile
+    container_name: novya-frontend
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
