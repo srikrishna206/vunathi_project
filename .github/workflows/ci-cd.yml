@@ -111,6 +111,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r backend/requirements.txt
 
+      # ➤ FIX FOR /app/logs PERMISSION ERROR
+      - name: Create /app/logs for Django
+        run: |
+          sudo mkdir -p /app/logs
+          sudo chmod -R 777 /app
+
       - name: Run Django tests
         env:
           DATABASE_URL: postgresql://postgres:12345@127.0.0.1:5433/novya
@@ -123,7 +129,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
-    # expose the image tag produced in build-and-push to the deploy step
     env:
       IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
     steps:
@@ -135,7 +140,6 @@ jobs:
 
       - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v0.1.8
-        # make IMAGE_TAG available to the remote script (expanded client-side)
         env:
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
         with:
@@ -146,7 +150,6 @@ jobs:
           script: |
             set -euo pipefail
 
-            # injected secrets (shell-side variables)
             DEPLOY_DIR="${{ secrets.EC2_DEPLOY_DIR }}"
             DOCKERHUB_USERNAME="${{ secrets.DOCKERHUB_USERNAME }}"
             DOCKERHUB_TOKEN="${{ secrets.DOCKERHUB_TOKEN }}"
@@ -159,14 +162,12 @@ jobs:
               exit 1
             fi
 
-            # create directory and ensure ownership so git doesn't complain
             sudo mkdir -p "$DEPLOY_DIR"
             CURUSER="$(id -un)"
             CURUID="$(id -u)"
             CURGID="$(id -g)"
             sudo chown -R "${CURUID}:${CURGID}" "$DEPLOY_DIR" || true
 
-            # clone if not present
             if [ ! -d "$DEPLOY_DIR/.git" ]; then
               if [ -n "$EC2_REPO_URL" ]; then
                 rm -rf "${DEPLOY_DIR:?}"/*
@@ -179,41 +180,34 @@ jobs:
 
             cd "$DEPLOY_DIR"
 
-            # avoid 'dubious ownership' git error
             git config --global --add safe.directory "$DEPLOY_DIR" || true
 
-            # update branch
             git fetch --all --prune || true
             git checkout "$BRANCH" || true
-            # if there are local edits to docker-compose.yml we don't want to fail.
             git reset --hard origin/"$BRANCH" || true
             git pull origin "$BRANCH" || true
 
-            # ensure docker & compose
             if ! command -v docker >/dev/null 2>&1; then
               sudo apt-get update
               sudo apt-get install -y docker.io
               sudo usermod -aG docker "$CURUSER" || true
             fi
+
             if ! docker compose version >/dev/null 2>&1; then
               sudo apt-get update
               sudo apt-get install -y docker-compose-plugin
             fi
 
-            # login to Docker Hub if credentials provided
             if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
               echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
             else
               echo "No Docker Hub credentials provided; will attempt to pull public images only."
             fi
 
-            # Use your Docker Hub namespace shown in your screenshot
             DOCKERHUB_OWNER="jeevankumar01"
 
-            # Replace placeholder owner in compose with actual Docker Hub username (safe)
             sed -i "s|\${DOCKERHUB_OWNER:-your-dockerhub-username}|${DOCKERHUB_OWNER}|g" docker-compose.yml || true
 
-            # Pull both the IMAGE_TAG (short SHA) and latest for each image (best-effort)
             IMAGES=(
               "${DOCKERHUB_OWNER}/novya-backend:${IMAGE_TAG}"
               "${DOCKERHUB_OWNER}/novya-backend:latest"
@@ -225,29 +219,24 @@ jobs:
 
             for img in "${IMAGES[@]}"; do
               echo "Pulling image: $img"
-              docker pull "$img" || echo "Warning: failed to pull $img (may be private or not exist)"
+              docker pull "$img" || echo "Warning: failed to pull $img"
             done
 
-            # To make docker-compose use the tagged images we just pulled (instead of :latest),
-            # replace occurrences of ":latest" in known image references with ":${IMAGE_TAG}".
             sed -i "s|${DOCKERHUB_OWNER}/novya-backend:latest|${DOCKERHUB_OWNER}/novya-backend:${IMAGE_TAG}|g" docker-compose.yml || true
             sed -i "s|${DOCKERHUB_OWNER}/novya-ai-backend:latest|${DOCKERHUB_OWNER}/novya-ai-backend:${IMAGE_TAG}|g" docker-compose.yml || true
             sed -i "s|${DOCKERHUB_OWNER}/novya-frontend:latest|${DOCKERHUB_OWNER}/novya-frontend:${IMAGE_TAG}|g" docker-compose.yml || true
 
-            # Bring up the stack (will use images available locally if present)
             docker compose pull || true
             docker compose up --remove-orphans -d
 
-            # Run migrations and collectstatic
             docker compose run --rm backend python manage.py migrate --noinput || true
             docker compose run --rm backend python manage.py collectstatic --noinput || true
 
-            # Show status and the images (visible in Actions logs)
             echo "=== docker compose ps ==="
             docker compose ps || true
-            echo "=== docker ps (running containers) ==="
+            echo "=== docker ps ==="
             docker ps --format "table {{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}" || true
-            echo "=== docker images (local images) ==="
+            echo "=== docker images ==="
             docker images | sed -n '1,200p' || true
 
             echo "Deployed images from Docker Hub owner: ${DOCKERHUB_OWNER} with tag: ${IMAGE_TAG}"
